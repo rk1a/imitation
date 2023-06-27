@@ -46,6 +46,7 @@ class RenderImageInfoWrapper(gym.Wrapper):
         self.use_file_cache = use_file_cache
         if self.use_file_cache:
             self.file_cache = tempfile.mkdtemp("imitation_RenderImageInfoWrapper")
+        self.render_kwargs = render_kwargs
 
     def step(self, action):
         obs, rew, done, info = self.env.step(action)
@@ -77,7 +78,7 @@ class RenderImageInfoWrapper(gym.Wrapper):
             info["rendered_img"] = unique_file_path
 
         # Do not show window of classic control envs
-        if self.env.viewer is not None and self.env.viewer.window.visible:
+        if hasattr(self.env, 'viewer') and self.env.viewer is not None and self.env.viewer.window.visible:
             self.env.viewer.window.set_visible(False)
 
         return obs, rew, done, info
