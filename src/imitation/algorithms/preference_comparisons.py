@@ -2149,9 +2149,16 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             # Gather new preferences #
             ##########################
             new_queries, trajectories = self._generate_queries(num_queries)
-            self._gather_preferences()
-            self._wait_for_pending_queries()
-            self._query(new_queries)
+
+            if i == 0:
+                self._query(new_queries)
+                self._gather_preferences()
+            else:
+                while len(self.preference_gatherer.pending_queries) > 0:
+                    self._gather_preferences()
+                    if len(self.preference_gatherer.pending_queries) > 0:
+                        time.sleep(15)
+                self._query(new_queries)
 
             # Free up RAM or disk space from keeping rendered images
             remove_rendered_images(trajectories)
@@ -2200,11 +2207,6 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             self._iteration += 1
 
         return {"reward_loss": reward_loss, "reward_accuracy": reward_accuracy}
-
-    def _wait_for_pending_queries(self):
-        while len(self.preference_gatherer.pending_queries) > 0:
-            self._gather_preferences()
-            time.sleep(15)
 
     def _add_preferences_to_dataset(self, collected_queries, collected_preferences):
         if len(collected_queries) > 0:
