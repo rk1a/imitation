@@ -2177,8 +2177,9 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
 
             # Free up RAM or disk space from keeping rendered images
             remove_rendered_images(trajectories)
-
-            self.dataset.push(queries, preferences)
+            
+            if len(queries) > 0:
+                self.dataset.push(queries, preferences)
             self.logger.log(f"Dataset now contains {len(self.dataset)} comparisons")
             # Skip training if dataset is empty
             if len(self.dataset) == 0:
