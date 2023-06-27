@@ -4,7 +4,7 @@ import os
 import shutil
 import tempfile
 import uuid
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union, Mapping, Any
 
 import cv2
 import gym
@@ -30,6 +30,7 @@ class RenderImageInfoWrapper(gym.Wrapper):
         env: gym.Env,
         scale_factor: float = 1.0,
         use_file_cache: bool = False,
+        render_kwargs: Union[None, Mapping[str, Any]] = None,
     ):
         """Builds RenderImageInfoWrapper.
 
@@ -37,6 +38,8 @@ class RenderImageInfoWrapper(gym.Wrapper):
             env: Environment to wrap.
             scale_factor: scales rendered images to be stored.
             use_file_cache: whether to save rendered images to disk.
+            render_kwargs: keyword arguments for environment rendering,
+               e.g. to disable agent view highlight in Minigrid
         """
         super().__init__(env)
         self.scale_factor = scale_factor
@@ -47,7 +50,11 @@ class RenderImageInfoWrapper(gym.Wrapper):
     def step(self, action):
         obs, rew, done, info = self.env.step(action)
 
-        rendered_image = self.render(mode="rgb_array")
+        if self.render_kwargs:
+            rendered_image = self.render(mode="rgb_array", **self.render_kwargs)
+        else:
+            rendered_image = self.render(mode="rgb_array")
+
         # Scale the render image
         scaled_size = (
             int(self.scale_factor * rendered_image.shape[0]),
