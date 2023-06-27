@@ -9,6 +9,7 @@ import os
 import pathlib
 import pickle
 import re
+import time
 import uuid
 from collections import defaultdict
 from typing import (
@@ -1315,11 +1316,6 @@ class PrefCollectGatherer(PreferenceGatherer):
 
     def __call__(self) -> Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
 
-        # TODO: create user-independent (automated) waiting policy
-        if self.wait_for_user:
-            print("Waiting for user to provide preferences. Press enter to continue.")
-            input()
-
         gathered_queries = []
         gathered_preferences = []
 
@@ -2152,42 +2148,21 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             ##########################
             # Gather new preferences #
             ##########################
-            num_steps = math.ceil(
-                self.transition_oversampling * 2 * num_queries * self.fragment_length,
-            )
-            self.logger.log(
-                f"Collecting {2 * num_queries} fragments ({num_steps} transitions)",
-            )
-            trajectories = self.trajectory_generator.sample(num_steps)
-            # This assumes there are no fragments missing initial timesteps
-            # (but allows for fragments missing terminal timesteps).
-            horizons = (len(traj) for traj in trajectories if traj.terminal)
-            self._check_fixed_horizon(horizons)
-            self.logger.log("Creating fragment pairs")
-
-            queries = self.fragmenter(trajectories, self.fragment_length, num_queries)
-
-            identified_queries = self.preference_querent(queries)
-            self.preference_gatherer.add(identified_queries)
-
-            with self.logger.accumulate_means("preferences"):
-                self.logger.log("Gathering preferences")
-                # Gather fragment pairs for which preferences have been provided
-                queries, preferences = self.preference_gatherer()
+            new_queries, trajectories = self._generate_queries(num_queries)
+            self._gather_preferences()
+            self._wait_for_pending_queries()
+            self._query(new_queries)
 
             # Free up RAM or disk space from keeping rendered images
             remove_rendered_images(trajectories)
-            
-            if len(queries) > 0:
-                self.dataset.push(queries, preferences)
-            self.logger.log(f"Dataset now contains {len(self.dataset)} comparisons")
-            # Skip training if dataset is empty
-            if len(self.dataset) == 0:
-                continue
 
             ##########################
             # Train the reward model #
             ##########################
+
+            # Skip training if dataset is empty
+            if len(self.dataset) == 0:
+                continue
 
             # On the first iteration, we train the reward model for longer,
             # as specified by initial_epoch_multiplier.
@@ -2225,3 +2200,40 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             self._iteration += 1
 
         return {"reward_loss": reward_loss, "reward_accuracy": reward_accuracy}
+
+    def _wait_for_pending_queries(self):
+        while len(self.preference_gatherer.pending_queries) > 0:
+            self._gather_preferences()
+            time.sleep(15)
+
+    def _add_preferences_to_dataset(self, collected_queries, collected_preferences):
+        if len(collected_queries) > 0:
+            self.dataset.push(collected_queries, collected_preferences)
+            self.logger.log(f"Dataset now contains {len(self.dataset)} comparisons")
+
+    def _query(self, queries):
+        identified_queries = self.preference_querent(queries)
+        self.preference_gatherer.add(identified_queries)
+
+    def _generate_queries(self, num_queries):
+        num_steps = math.ceil(
+            self.transition_oversampling * 2 * num_queries * self.fragment_length,
+        )
+        self.logger.log(
+            f"Collecting {2 * num_queries} fragments ({num_steps} transitions)",
+        )
+        trajectories = self.trajectory_generator.sample(num_steps)
+        # This assumes there are no fragments missing initial timesteps
+        # (but allows for fragments missing terminal timesteps).
+        horizons = (len(traj) for traj in trajectories if traj.terminal)
+        self._check_fixed_horizon(horizons)
+        self.logger.log("Creating fragment pairs")
+        queries = self.fragmenter(trajectories, self.fragment_length, num_queries)
+        return queries, trajectories
+
+    def _gather_preferences(self):
+        with self.logger.accumulate_means("preferences"):
+            self.logger.log("Gathering preferences")
+            # Gather fragment pairs for which preferences have been provided
+            queries, preferences = self.preference_gatherer()
+        self._add_preferences_to_dataset(queries, preferences)
