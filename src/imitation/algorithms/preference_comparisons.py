@@ -966,15 +966,6 @@ class ZooniverseQuerent(VideoBasedQuerent):
         self.linked_subject_set_id = linked_subject_set_id
         self.experiment_id = experiment_id
 
-    def __call__(
-        self,
-        queries: Sequence[TrajectoryWithRewPair],
-    ) -> Dict[str, TrajectoryWithRewPair]:
-        identified_queries = super().__call__(queries)
-        for query_id in identified_queries.keys():
-            self._query(query_id)
-        return identified_queries
-
     def _query(self, query_id):
 
         # Authenticate with Zooniverse
