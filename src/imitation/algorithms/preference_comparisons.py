@@ -940,6 +940,12 @@ class VideoBasedQuerent(PreferenceQuerent):
         pass
 
 
+def authenticate_with_zooniverse():
+    panoptes_username = os.environ["PANOPTES_USERNAME"]
+    panoptes_password = os.environ["PANOPTES_PASSWORD"]
+    Panoptes.connect(username=panoptes_username, password=panoptes_password)
+
+
 class ZooniverseQuerent(VideoBasedQuerent):
     """Sends queries to the Zooniverse interface."""
 
@@ -947,7 +953,7 @@ class ZooniverseQuerent(VideoBasedQuerent):
             self,
             zoo_project_id: int,
             zoo_workflow_id: int,
-            linked_subject_set_id: int,
+            subject_set_id: int,
             experiment_id: int,
             video_output_dir: AnyPath,
             video_fps: str = 20,
@@ -961,49 +967,50 @@ class ZooniverseQuerent(VideoBasedQuerent):
             rng=rng,
             custom_logger=custom_logger
         )
+
         self.zoo_project_id = zoo_project_id
         self.zoo_workflow_id = zoo_workflow_id
-        self.linked_subject_set_id = linked_subject_set_id
         self.experiment_id = experiment_id
+        self.subject_set_id = subject_set_id
+        self.subject_set = SubjectSet.find(self.subject_set_id)
 
     def _query(self, query_id):
+        authenticate_with_zooniverse()
+        subject = self._create_subject(query_id)
+        self._send_subject_to_zooniverse(subject)
 
-        # Authenticate with Zooniverse
-        panoptes_username = os.environ["PANOPTES_USERNAME"]
-        panoptes_password = os.environ["PANOPTES_PASSWORD"]
-        Panoptes.connect(username=panoptes_username, password=panoptes_password)
-
-        # Find project and workflow
-        project = Project.find(self.zoo_project_id)
-        workflow = Workflow.find(self.zoo_workflow_id)
-
-        # Find subject sets
-        linked_subject_set = SubjectSet.find(self.linked_subject_set_id)
-
-        # Create subject for this query_id
+    def _create_subject(self, query_id):
         subject = Subject()
+        self._link_project(subject)
+        output_file_name = self.add_videos(subject, query_id)
+        self._add_metadata(subject, query_id, output_file_name)
+        subject.save()
+        return subject
+
+    def _link_project(self, subject):
+        project = Project.find(self.zoo_project_id)
         subject.links.project = project
 
+    def add_videos(self, subject, query_id):
         output_file_name = os.path.join(
-                self.video_output_dir, f"{query_id}" + "-{}.gif"
-            )
-
+            self.video_output_dir, f"{query_id}" + "-{}.gif"
+        )
         subject.add_location(open(output_file_name.format("left"), "rb"))
         subject.add_location(open(output_file_name.format("right"), "rb"))
+        return output_file_name
 
+    def _add_metadata(self, subject, query_id, output_file_name):
         subject.metadata["query_id"] = f"{query_id}"
         subject.metadata["#left_video"] = output_file_name.format("left")
         subject.metadata["#right_video"] = output_file_name.format("right")
         subject.metadata["#video_fps"] = self.frames_per_second
         subject.metadata["#zoo_project_id"] = self.zoo_project_id
         subject.metadata["#zoo_workflow_id"] = self.zoo_workflow_id
-        subject.metadata["#linked_subject_set_id"] = self.linked_subject_set_id
+        subject.metadata["#linked_subject_set_id"] = self.subject_set_id
         subject.metadata["#experiment_id"] = self.experiment_id
 
-        subject.save()
-
-        # Add the subject to the linked subject set
-        linked_subject_set.add(subject)
+    def _send_subject_to_zooniverse(self, subject):
+        self.subject_set.add(subject)
 
 
 class RESTQuerent(VideoBasedQuerent):
@@ -1481,7 +1488,7 @@ class ZooniverseGatherer(AsynchronousHumanGatherer):
         self.querent = ZooniverseQuerent(
             zoo_project_id=zoo_project_id,
             zoo_workflow_id=zoo_workflow_id,
-            linked_subject_set_id=linked_subject_set_id,
+            subject_set_id=linked_subject_set_id,
             rng=rng,
             custom_logger=custom_logger,
             **querent_kwargs,
@@ -1545,10 +1552,7 @@ class ZooniverseGatherer(AsynchronousHumanGatherer):
 
     def _gather_preference(self, query_id: str) -> float:
 
-        # Authenticate with Zooniverse
-        panoptes_username = os.environ["PANOPTES_USERNAME"]
-        panoptes_password = os.environ["PANOPTES_PASSWORD"]
-        Panoptes.connect(username=panoptes_username, password=panoptes_password)
+        authenticate_with_zooniverse()
 
         self._process_zoo_classifications()
 
