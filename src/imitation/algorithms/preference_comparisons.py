@@ -829,21 +829,18 @@ class PreferenceQuerent:
         return {str(uuid.uuid4()): query for query in queries}
 
 
-class PrefCollectQuerent(PreferenceQuerent):
-    """Sends queries to a preference collection web service via HTTP requests."""
-
+class VideoBasedQuerent(PreferenceQuerent):
     def __init__(
-        self,
-        pref_collect_address: str,
-        video_output_dir: str,
-        video_fps: int = 20,
-        rng: Optional[np.random.Generator] = None,
-        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+            self,
+            video_output_dir: str,
+            video_type="webm",
+            video_fps: int = 20,
+            rng: Optional[np.random.Generator] = None,
+            custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ):
-        """Initializes the PrefCollect querent.
+        """Initializes the querent.
 
         Args:
-            pref_collect_address: end point of the PrefCollect web service.
             video_output_dir: path to the video clip directory.
             video_fps: frames per second of the generated videos.
             rng: random number generator, if applicable.
@@ -851,8 +848,8 @@ class PrefCollectQuerent(PreferenceQuerent):
         """
         super().__init__(custom_logger=custom_logger)
         self.rng = rng
-        self.query_endpoint = pref_collect_address + "/preferences/query/"
         self.video_output_dir = video_output_dir
+        self.video_type = video_type
         self.frames_per_second = video_fps
 
         # Create video directory
@@ -863,179 +860,187 @@ class PrefCollectQuerent(PreferenceQuerent):
         queries: Sequence[TrajectoryWithRewPair],
     ) -> Dict[str, TrajectoryWithRewPair]:
         identified_queries = super().__call__(queries)
-
-        # Save fragment videos and submit queries
         for query_id, query in identified_queries.items():
-            output_file_name = os.path.join(
-                self.video_output_dir,
-                f"{query_id}" + "-{}.webm",
-            )
-            write_fragment_video(
-                query[0],
-                frames_per_second=self.frames_per_second,
-                output_path=output_file_name.format("left"),
-            )
-            write_fragment_video(
-                query[1],
-                frames_per_second=self.frames_per_second,
-                output_path=output_file_name.format("right"),
-            )
+            self._write_query_videos(query_id, query)
             self._query(query_id)
-
         return identified_queries
+
+    def _write_query_videos(self, query_id, query):
+        output_file_name = os.path.join(
+            self.video_output_dir,
+            f"{query_id}" + "-{}" + f".{self.video_type}",
+        )
+        self._write_fragment_video(
+            query[0],
+            output_path=output_file_name.format("left"),
+        )
+        self._write_fragment_video(
+            query[1],
+            output_path=output_file_name.format("right"),
+        )
+
+    def _write_fragment_video(
+            self,
+            fragment: TrajectoryWithRew,
+            output_path: AnyPath,
+            progress_logger: bool = True,
+    ) -> None:
+        """Write fragment video clip."""
+        frames_list: List[Union[os.PathLike, np.ndarray]] = []
+        # Create fragment videos from environment's render images if available
+        if fragment.infos is not None and "rendered_img" in fragment.infos[0]:
+            for i in range(len(fragment.infos)):
+                frame: Union[os.PathLike, np.ndarray] = fragment.infos[i]["rendered_img"]
+                if isinstance(frame, np.ndarray):
+                    frame = self._add_missing_rgb_channels(frame)
+                frames_list.append(frame)
+        # Create fragment video from observations if possible
+        else:
+            if isinstance(fragment.obs, np.ndarray):
+                frames_list = [
+                    frame for frame in self._add_missing_rgb_channels(fragment.obs[1:])
+                ]
+            else:
+                # TODO add support for DictObs
+                raise ValueError(
+                    "Unsupported observation type "
+                    f"for writing fragment video: {type(fragment.obs)}",
+                )
+        # Note: `ImageSeqeuenceClip` handily accepts both
+        #       lists of image paths or numpy arrays
+        clip = ImageSequenceClip(frames_list, fps=self.frames_per_second)
+        moviepy_logger = None if not progress_logger else "bar"
+        if output_path.endswith('.gif'):
+            clip.write_gif(output_path, program='ffmpeg', logger=moviepy_logger)
+        else:
+            clip.write_videofile(output_path, logger=moviepy_logger)
+
+    @staticmethod
+    def _add_missing_rgb_channels(frames: np.ndarray) -> np.ndarray:
+        """Add missing RGB channels if needed.
+        If less than three channels are present, multiplies the last channel
+        until all three channels exist.
+
+        Args:
+            frames: a stack of frames with potentially missing channels;
+                expected shape (batch, height, width, channels).
+
+        Returns:
+            a stack of frames with exactly three channels.
+        """
+        if frames.shape[-1] < 3:
+            missing_channels = 3 - frames.shape[-1]
+            frames = np.concatenate(
+                [frames] + missing_channels * [frames[..., -1][..., None]],
+                axis=-1,
+                )
+        return frames
+
+    def _query(self, query_id):
+        pass
+
+
+def authenticate_with_zooniverse():
+    panoptes_username = os.environ["PANOPTES_USERNAME"]
+    panoptes_password = os.environ["PANOPTES_PASSWORD"]
+    Panoptes.connect(username=panoptes_username, password=panoptes_password)
+
+
+class ZooniverseQuerent(VideoBasedQuerent):
+    """Sends queries to the Zooniverse interface."""
+
+    def __init__(
+            self,
+            zoo_project_id: int,
+            zoo_workflow_id: int,
+            subject_set_id: int,
+            experiment_id: int,
+            video_output_dir: AnyPath,
+            video_fps: str = 20,
+            rng: Optional[np.random.Generator] = None,
+            custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        super().__init__(
+            video_output_dir=video_output_dir,
+            video_type="gif",
+            video_fps=video_fps,
+            rng=rng,
+            custom_logger=custom_logger
+        )
+
+        self.zoo_project_id = zoo_project_id
+        self.zoo_workflow_id = zoo_workflow_id
+        self.experiment_id = experiment_id
+        self.subject_set_id = subject_set_id
+        self.subject_set = SubjectSet.find(self.subject_set_id)
+
+    def _query(self, query_id):
+        authenticate_with_zooniverse()
+        subject = self._create_subject(query_id)
+        self._send_subject_to_zooniverse(subject)
+
+    def _create_subject(self, query_id):
+        subject = Subject()
+        self._link_project(subject)
+        output_file_name = self.add_videos(subject, query_id)
+        self._add_metadata(subject, query_id, output_file_name)
+        subject.save()
+        return subject
+
+    def _link_project(self, subject):
+        project = Project.find(self.zoo_project_id)
+        subject.links.project = project
+
+    def add_videos(self, subject, query_id):
+        output_file_name = os.path.join(
+            self.video_output_dir, f"{query_id}" + "-{}.gif"
+        )
+        subject.add_location(open(output_file_name.format("left"), "rb"))
+        subject.add_location(open(output_file_name.format("right"), "rb"))
+        return output_file_name
+
+    def _add_metadata(self, subject, query_id, output_file_name):
+        subject.metadata["query_id"] = f"{query_id}"
+        subject.metadata["#left_video"] = output_file_name.format("left")
+        subject.metadata["#right_video"] = output_file_name.format("right")
+        subject.metadata["#video_fps"] = self.frames_per_second
+        subject.metadata["#zoo_project_id"] = self.zoo_project_id
+        subject.metadata["#zoo_workflow_id"] = self.zoo_workflow_id
+        subject.metadata["#linked_subject_set_id"] = self.subject_set_id
+        subject.metadata["#experiment_id"] = self.experiment_id
+
+    def _send_subject_to_zooniverse(self, subject):
+        self.subject_set.add(subject)
+
+
+class RESTQuerent(VideoBasedQuerent):
+    """Sends queries to a REST web service."""
+
+    def __init__(
+        self,
+        collection_service_address: str,
+        video_output_dir: str,
+        video_fps: int = 20,
+        rng: Optional[np.random.Generator] = None,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        """Initializes the querent.
+
+        Args:
+            collection_service_address: Network address of the collection service's REST interface.
+            video_output_dir: path to the video clip directory.
+            video_fps: frames per second of the generated videos.
+            rng: random number generator, if applicable.
+            custom_logger: Where to log to; if None (default), creates a new logger.
+        """
+        super().__init__(video_output_dir, video_fps=video_fps, rng=rng, custom_logger=custom_logger)
+        self.query_endpoint = collection_service_address + "/preferences/query/"
 
     def _query(self, query_id):
         requests.put(
             self.query_endpoint + query_id,
             json={"uuid": "{}".format(query_id)},
         )
-
-
-class ZooniverseQuerent(PrefCollectQuerent):
-    """Sends queries to the Zooniverse interface."""
-
-    def __init__(
-        self,
-        pref_collect_address: str,
-        zoo_project_id: int,
-        zoo_workflow_id: int,
-        linked_subject_set_id: int,
-        experiment_id: int,
-        video_output_dir: AnyPath,
-        video_fps: str = 20,
-        rng: Optional[np.random.Generator] = None,
-        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
-    ):
-        super().__init__(pref_collect_address, video_output_dir, video_fps, rng, custom_logger)
-        self.zoo_project_id = zoo_project_id
-        self.zoo_workflow_id = zoo_workflow_id
-        self.linked_subject_set_id = linked_subject_set_id
-        self.experiment_id = experiment_id
-        self.video_fps = video_fps
-
-    def __call__(
-        self,
-        queries: Sequence[TrajectoryWithRewPair],
-    ) -> Dict[str, TrajectoryWithRewPair]:
-        # Call PreferenceQuerent not PrefCollectQuerent
-        identified_queries = super(PrefCollectQuerent, self).__call__(queries)
-
-        # Save fragment videos and submit queries
-        for query_id, query in identified_queries.items():
-            output_file_name = os.path.join(
-                self.video_output_dir,
-                f"{query_id}" + "-{}.gif",
-            )
-            write_fragment_video(
-                query[0],
-                frames_per_second=self.frames_per_second,
-                output_path=output_file_name.format("left"),
-            )
-            write_fragment_video(
-                query[1],
-                frames_per_second=self.frames_per_second,
-                output_path=output_file_name.format("right"),
-            )
-            self._query(query_id)
-
-        return identified_queries
-
-    def _query(self, query_id):
-    
-        # Authenticate with Zooniverse
-        panoptes_username = os.environ["PANOPTES_USERNAME"]
-        panoptes_password = os.environ["PANOPTES_PASSWORD"]
-        Panoptes.connect(username=panoptes_username, password=panoptes_password)
-        
-        # Find project and workflow
-        project = Project.find(self.zoo_project_id)
-        workflow = Workflow.find(self.zoo_workflow_id)
-        
-        # Find subject sets
-        linked_subject_set = SubjectSet.find(self.linked_subject_set_id)
-        
-        # Create subject for this query_id
-        subject = Subject()
-        subject.links.project = project
-        
-        output_file_name = os.path.join(
-                self.video_output_dir, f"{query_id}" + "-{}.gif"
-            )
-            
-        subject.add_location(open(output_file_name.format("left"), "rb"))
-        subject.add_location(open(output_file_name.format("right"), "rb"))
-        
-        subject.metadata["query_id"] = f"{query_id}"
-        subject.metadata["#left_video"] = output_file_name.format("left")
-        subject.metadata["#right_video"] = output_file_name.format("right")
-        subject.metadata["#video_fps"] = self.video_fps
-        subject.metadata["#zoo_project_id"] = self.zoo_project_id
-        subject.metadata["#zoo_workflow_id"] = self.zoo_workflow_id
-        subject.metadata["#linked_subject_set_id"] = self.linked_subject_set_id
-        subject.metadata["#experiment_id"] = self.experiment_id
-        
-        subject.save()
-        
-        # Add the subject to the linked subject set
-        linked_subject_set.add(subject)
-        
-
-def add_missing_rgb_channels(frames: np.ndarray) -> np.ndarray:
-    """Add missing RGB channels if needed.
-    If less than three channels are present, multiplies the last channel
-    until all three channels exist.
-
-    Args:
-        frames: a stack of frames with potentially missing channels;
-            expected shape (batch, height, width, channels).
-
-    Returns:
-        a stack of frames with exactly three channels.
-    """
-    if frames.shape[-1] < 3:
-        missing_channels = 3 - frames.shape[-1]
-        frames = np.concatenate(
-            [frames] + missing_channels * [frames[..., -1][..., None]],
-            axis=-1,
-        )
-    return frames
-
-
-def write_fragment_video(
-    fragment: TrajectoryWithRew,
-    frames_per_second: int,
-    output_path: AnyPath,
-    progress_logger: bool = True,
-) -> None:
-    """Write fragment video clip."""
-    frames_list: List[Union[os.PathLike, np.ndarray]] = []
-    # Create fragment videos from environment's render images if available
-    if fragment.infos is not None and "rendered_img" in fragment.infos[0]:
-        for i in range(len(fragment.infos)):
-            frame: Union[os.PathLike, np.ndarray] = fragment.infos[i]["rendered_img"]
-            if isinstance(frame, np.ndarray):
-                frame = add_missing_rgb_channels(frame)
-            frames_list.append(frame)
-    # Create fragment video from observations if possible
-    else:
-        if isinstance(fragment.obs, np.ndarray):
-            frames_list = [
-                frame for frame in add_missing_rgb_channels(fragment.obs[1:])
-            ]
-        else:
-            # TODO add support for DictObs
-            raise ValueError(
-                "Unsupported observation type "
-                f"for writing fragment video: {type(fragment.obs)}",
-            )
-    # Note: `ImageSeqeuenceClip` handily accepts both
-    #       lists of image paths or numpy arrays
-    clip = ImageSequenceClip(frames_list, fps=frames_per_second)
-    moviepy_logger = None if not progress_logger else "bar"
-    if output_path.endswith('.gif'):
-        clip.write_gif(output_path, program='ffmpeg', logger=moviepy_logger)
-    else:
-        clip.write_videofile(output_path, logger=moviepy_logger)
 
 
 class PreferenceGatherer(abc.ABC):
@@ -1210,11 +1215,10 @@ class SynchronousHumanGatherer(PreferenceGatherer):
             rng: random number generator
         """
         super().__init__(custom_logger=custom_logger, rng=rng)
+        self.querent = VideoBasedQuerent(video_output_dir=video_dir, video_fps=frames_per_second)
         self.video_dir = video_dir
-        os.makedirs(video_dir, exist_ok=True)
         self.video_width = video_width
         self.video_height = video_height
-        self.frames_per_second = frames_per_second
 
     def gather(self) -> Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
         """Displays each pair of fragments and asks for a preference.
@@ -1228,22 +1232,12 @@ class SynchronousHumanGatherer(PreferenceGatherer):
             A numpy array of 1 if fragment 1 is preferred and 0 otherwise, with shape
             (b, ), where b is the length of `fragment_pairs`
         """
+        queries = []
         preferences = np.zeros(len(self.pending_queries), dtype=np.float32)
         for i, (query_id, query) in enumerate(self.pending_queries.items()):
-            write_fragment_video(
-                query[0],
-                frames_per_second=self.frames_per_second,
-                output_path=os.path.join(self.video_dir, f"{query_id}-left.webm"),
-            )
-            write_fragment_video(
-                query[1],
-                frames_per_second=self.frames_per_second,
-                output_path=os.path.join(self.video_dir, f"{query_id}-right.webm"),
-            )
             if self._display_videos_and_gather_preference(query_id):
+                queries.append(query)
                 preferences[i] = 1
-
-        queries = list(self.pending_queries.values())
         self.pending_queries.clear()
         return queries, preferences
 
@@ -1399,33 +1393,15 @@ class SynchronousHumanGatherer(PreferenceGatherer):
         return "PYTEST_CURRENT_TEST" in os.environ
 
 
-class PrefCollectGatherer(PreferenceGatherer):
-    """Gathers preferences from PrefCollect interface."""
-
+class AsynchronousHumanGatherer(PreferenceGatherer, abc.ABC):
     def __init__(
-        self,
-        pref_collect_address: str,
-        wait_for_user: bool = True,
-        rng: Optional[np.random.Generator] = None,
-        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
-        querent_kwargs: Optional[Mapping] = None,
+            self,
+            wait_for_user: bool = True,
+            rng: Optional[np.random.Generator] = None,
+            custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+            querent_kwargs: Optional[Mapping] = None,
     ) -> None:
-        """Initializes the preference gatherer.
-
-        Args:
-            pref_collect_address: Network address to PrefCollect instance.
-            wait_for_user: Waits for user to input their preferences.
-            rng: random number generator, if applicable.
-            custom_logger: Where to log to; if None (default), creates a new logger.
-            querent_kwargs: Keyword arguments passed to the querent.
-        """
-        super().__init__(rng, custom_logger)
-        querent_kwargs = querent_kwargs if querent_kwargs else {}
-        self.querent = PrefCollectQuerent(
-            pref_collect_address=pref_collect_address,
-            **querent_kwargs,
-        )
-        self.query_endpoint = pref_collect_address + "/preferences/query/"
+        super().__init__(rng, custom_logger, querent_kwargs)
         self.pending_queries = {}
         self.wait_for_user = wait_for_user
 
@@ -1451,117 +1427,151 @@ class PrefCollectGatherer(PreferenceGatherer):
 
         return gathered_queries, np.array(gathered_preferences, dtype=np.float32)
 
+    @abc.abstractmethod
+    def _gather_preference(self, query_id: str) -> float:
+        raise NotImplementedError
+
+
+class RESTGatherer(AsynchronousHumanGatherer):
+    """Gathers preferences from a REST interface."""
+
+    def __init__(
+            self,
+            collection_service_address: str,
+            wait_for_user: bool = True,
+            rng: Optional[np.random.Generator] = None,
+            custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+            querent_kwargs: Optional[Mapping] = None,
+    ) -> None:
+        """Initializes the preference gatherer.
+
+        Args:
+            collection_service_address: Network address of the collection service's REST interface.
+            wait_for_user: Waits for user to input their preferences.
+            rng: random number generator, if applicable.
+            custom_logger: Where to log to; if None (default), creates a new logger.
+            querent_kwargs: Keyword arguments passed to the querent.
+        """
+        super().__init__(wait_for_user, rng, custom_logger)
+        querent_kwargs = querent_kwargs if querent_kwargs else {}
+        self.querent = RESTQuerent(
+            collection_service_address=collection_service_address,
+            **querent_kwargs,
+        )
+        self.query_endpoint = collection_service_address + "/preferences/query/"
+
     def _gather_preference(self, query_id: str) -> float:
         answered_query = requests.get(self.query_endpoint + query_id).json()
         return answered_query["label"]
 
 
-class ZooniverseGatherer(PrefCollectGatherer):
+class ZooniverseGatherer(AsynchronousHumanGatherer):
     """Gathers preferences from Zooniverse interface."""
 
-    def __init__(
-        self,
-        pref_collect_address: str,
-        zoo_project_id: int,
-        zoo_workflow_id: int,
-        linked_subject_set_id: int,
-        wait_for_user: bool = True,
-        rng: Optional[np.random.Generator] = None,
-        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
-        querent_kwargs: Optional[Mapping] = None
-    ) -> None:
+    def __init__(self, zoo_project_id: int, zoo_workflow_id: int, linked_subject_set_id: int,
+                 wait_for_user: bool = True, rng: Optional[np.random.Generator] = None,
+                 custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+                 querent_kwargs: Optional[Mapping] = None) -> None:
         """Initializes the preference gatherer.
 
         Args:
-            pref_collect_address: Network address to PrefCollect instance.
             wait_for_user: Waits for user to input their preferences.
             rng: random number generator, if applicable.
             custom_logger: Where to log to; if None (default), creates a new logger.
         """
-        video_output_dir = querent_kwargs["video_output_dir"]
-        super().__init__(pref_collect_address, querent_kwargs={"video_output_dir": querent_kwargs["video_output_dir"]})
-        self.querent = ZooniverseQuerent(
-            pref_collect_address,
-            **querent_kwargs
+        super().__init__(
+            wait_for_user=wait_for_user,
+            rng=rng,
+            custom_logger=custom_logger,
         )
-        
+        self.querent = ZooniverseQuerent(
+            zoo_project_id=zoo_project_id,
+            zoo_workflow_id=zoo_workflow_id,
+            subject_set_id=linked_subject_set_id,
+            rng=rng,
+            custom_logger=custom_logger,
+            **querent_kwargs,
+        )
+
         self.zoo_project_id = zoo_project_id
         self.zoo_workflow_id = zoo_workflow_id
-        self.linked_subject_set_id = linked_subject_set_id
-        
+        self.subject_set_id = linked_subject_set_id
+
         # Find workflow
         self.workflow = Workflow.find(self.zoo_workflow_id)
-        
-        # Define annotation to label map
-        self.annotation_to_label = {
+
+        # Define classification to preference label map
+        self.classification_to_preference_label = {
             0: 1,
             1: 0,
             2: .5,
             3: -1,
             None: None
         }
-        
-        self.last_id = 0
+
+        self.last_classification_id = 0
         self.query_to_subject = {}
-        self.subject_to_annotations = {}
-        
+        self.subject_to_classifications = {}  # TODO: maybe rename because items are preference labels?
+
     def _process_zoo_classifications(self):
-        
+
         # Access classifications from the last_id
         classifications = Classification.where(
-            last_id=self.last_id,
+            last_id=self.last_classification_id,
             scope='project',
             project_id=self.zoo_project_id,
             workflow_id=self.zoo_workflow_id
         )
-        
+
         # get linked subjects and their statuses
-        statuses = self.workflow.subject_workflow_statuses(self.linked_subject_set_id)
-        linked_subject_statuses = {s.raw['links']['subject']: s.raw['retirement_reason'] for s in statuses}
-        
-        for c in classifications:
-            d = c.raw
+        subject_to_status = self._get_subject_statuses()
+
+        for classification_object in classifications:
+            classification = classification_object.raw
             # Extract subject id
-            sid = int(d["links"]["subjects"][0])
+            sid = int(classification["links"]["subjects"][0])
             # Check that the subject is linked to workflow
             if sid in set(linked_subjects):
                 # Get subject status
-                status = linked_subject_statuses[sid]
+                status = subject_to_status[sid]
                 # Check subject isretired
                 if status is not None:
-                    label = self.annotation_to_label[d["annotations"][0]["value"]]
+                    label = self.classification_to_preference_label[classification["annotations"][0]["value"]]
                     try:
                         # Add label for this classification for the subject
-                        self.subject_to_annotations[sid].append(label)
+                        self.subject_to_classifications[sid].append(label)
                     except KeyError:
                         # Get query_id for this subject and add it to map
                         subject = Subject.find(sid)
                         self.query_to_subject[subject.raw["metadata"]["query_id"]] = sid
                         # Create map entry for this subject
-                        self.subject_to_annotations[sid] = [label]
-            self.last_id = d['id']
+                        self.subject_to_classifications[sid] = [label]
+            self.last_classification_id = classification['id']
+
+    def _get_subject_statuses(self):
+        statuses = self.workflow.subject_workflow_statuses(self.subject_set_id)
+        subject_to_status = {s.raw['links']['subject']: s.raw['retirement_reason'] for s in statuses}
+        return subject_to_status
 
     def _gather_preference(self, query_id: str) -> float:
-                
-        # Authenticate with Zooniverse
-        panoptes_username = os.environ["PANOPTES_USERNAME"]
-        panoptes_password = os.environ["PANOPTES_PASSWORD"]
-        Panoptes.connect(username=panoptes_username, password=panoptes_password)
-        
+
+        authenticate_with_zooniverse()
+
         self._process_zoo_classifications()
-        
+
         # Find linked subject set
-        linked_subject_set = SubjectSet.find(self.linked_subject_set_id)
-        
+        linked_subject_set = SubjectSet.find(self.subject_set_id)
+
         # Get subject_id corresponding to query_id
         subject_id = self.query_to_subject[query_id]
-        
+
         # Get reduced_label for subject_id aggregated from each annotation for that subject
-        reduced_label = self._reduce_annotations(self.subject_to_annotations[subject_id])
-        
+        reduced_label = self._reduce_annotations(self.subject_to_classifications[subject_id])
+
         return reduced_label
-    
-    def _reduce_annotations(self, annotations):
+
+    @staticmethod
+    def _reduce_annotations(annotations):
         # Aggregate Zooniverse classifications
         count = Counter(annotations)
         return count.most_common(1)[0][0]
