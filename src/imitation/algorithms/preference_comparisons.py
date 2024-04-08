@@ -951,8 +951,8 @@ class ZooniverseQuerent(VideoBasedQuerent):
 
     def __init__(
             self,
-            zoo_project_id: int,
-            zoo_workflow_id: int,
+            project_id: int,
+            workflow_id: int,
             subject_set_id: int,
             experiment_id: int,
             video_output_dir: AnyPath,
@@ -968,8 +968,8 @@ class ZooniverseQuerent(VideoBasedQuerent):
             custom_logger=custom_logger
         )
 
-        self.zoo_project_id = zoo_project_id
-        self.zoo_workflow_id = zoo_workflow_id
+        self.project_id = project_id
+        self.workflow_id = workflow_id
         self.experiment_id = experiment_id
         self.subject_set_id = subject_set_id
         self.subject_set = SubjectSet.find(self.subject_set_id)
@@ -988,7 +988,7 @@ class ZooniverseQuerent(VideoBasedQuerent):
         return subject
 
     def _link_project(self, subject):
-        project = Project.find(self.zoo_project_id)
+        project = Project.find(self.project_id)
         subject.links.project = project
 
     def add_videos(self, subject, query_id):
@@ -1004,8 +1004,8 @@ class ZooniverseQuerent(VideoBasedQuerent):
         subject.metadata["#left_video"] = output_file_name.format("left")
         subject.metadata["#right_video"] = output_file_name.format("right")
         subject.metadata["#video_fps"] = self.frames_per_second
-        subject.metadata["#zoo_project_id"] = self.zoo_project_id
-        subject.metadata["#zoo_workflow_id"] = self.zoo_workflow_id
+        subject.metadata["#project_id"] = self.project_id
+        subject.metadata["#workflow_id"] = self.workflow_id
         subject.metadata["#linked_subject_set_id"] = self.subject_set_id
         subject.metadata["#experiment_id"] = self.experiment_id
 
@@ -1468,7 +1468,7 @@ class RESTGatherer(AsynchronousHumanGatherer):
 class ZooniverseGatherer(AsynchronousHumanGatherer):
     """Gathers preferences from Zooniverse interface."""
 
-    def __init__(self, zoo_project_id: int, zoo_workflow_id: int, linked_subject_set_id: int,
+    def __init__(self, project_id: int, workflow_id: int, linked_subject_set_id: int,
                  wait_for_user: bool = True, rng: Optional[np.random.Generator] = None,
                  custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
                  querent_kwargs: Optional[Mapping] = None) -> None:
@@ -1485,23 +1485,21 @@ class ZooniverseGatherer(AsynchronousHumanGatherer):
             custom_logger=custom_logger,
         )
         self.querent = ZooniverseQuerent(
-            zoo_project_id=zoo_project_id,
-            zoo_workflow_id=zoo_workflow_id,
+            project_id=project_id,
+            workflow_id=workflow_id,
             subject_set_id=linked_subject_set_id,
             rng=rng,
             custom_logger=custom_logger,
             **querent_kwargs,
         )
 
-        self.zoo_project_id = zoo_project_id
-        self.zoo_workflow_id = zoo_workflow_id
+        self.project_id = project_id
+        self.workflow_id = workflow_id
         self.subject_set_id = linked_subject_set_id
 
-        # Find workflow
-        self.workflow = Workflow.find(self.zoo_workflow_id)
+        self.workflow = Workflow.find(self.workflow_id)
 
-        # Define classification to preference label map
-        self.classification_to_preference_label = {
+        self.annotation_to_preference_label = {
             0: 1,
             1: 0,
             2: .5,
@@ -1511,68 +1509,55 @@ class ZooniverseGatherer(AsynchronousHumanGatherer):
 
         self.last_classification_id = 0
         self.query_to_subject = {}
-        self.subject_to_classifications = {}  # TODO: maybe rename because items are preference labels?
+        self.subject_to_preference_label = {}
 
-    def _process_zoo_classifications(self):
+    def _gather_preference(self, query_id: str) -> float:
+        authenticate_with_zooniverse()
+        self._process_classifications()
+        subject_id = self.query_to_subject[query_id]
+        reduced_label = self._reduce_annotations(self.subject_to_classifications[subject_id])
+        return reduced_label
 
-        # Access classifications from the last_id
-        classifications = Classification.where(
-            last_id=self.last_classification_id,
-            scope='project',
-            project_id=self.zoo_project_id,
-            workflow_id=self.zoo_workflow_id
-        )
-
-        # get linked subjects and their statuses
-        subject_to_status = self._get_subject_statuses()
-
-        for classification_object in classifications:
-            classification = classification_object.raw
-            # Extract subject id
-            sid = int(classification["links"]["subjects"][0])
-            # Check that the subject is linked to workflow
-            if sid in set(linked_subjects):
-                # Get subject status
-                status = subject_to_status[sid]
-                # Check subject isretired
-                if status is not None:
-                    label = self.classification_to_preference_label[classification["annotations"][0]["value"]]
-                    try:
-                        # Add label for this classification for the subject
-                        self.subject_to_classifications[sid].append(label)
-                    except KeyError:
-                        # Get query_id for this subject and add it to map
-                        subject = Subject.find(sid)
-                        self.query_to_subject[subject.raw["metadata"]["query_id"]] = sid
-                        # Create map entry for this subject
-                        self.subject_to_classifications[sid] = [label]
+    def _process_classifications(self):
+        subject_is_retired = self._get_subject_statuses()
+        classifications = self._get_classifications()
+        for classification in classifications:
+            subject_id = int(classification["links"]["subjects"][0])
+            if subject_is_retired[subject_id]:
+                label = self._extract_preference_label(classification)
+                self._assign_label_to_subject(subject_id, label)
             self.last_classification_id = classification['id']
 
     def _get_subject_statuses(self):
         statuses = self.workflow.subject_workflow_statuses(self.subject_set_id)
-        subject_to_status = {s.raw['links']['subject']: s.raw['retirement_reason'] for s in statuses}
-        return subject_to_status
+        subject_is_retired = {s.raw['links']['subject']: s.raw['retirement_reason'] is not None for s in statuses}
+        return subject_is_retired
 
-    def _gather_preference(self, query_id: str) -> float:
+    def _get_classifications(self):
+        classifications = Classification.where(
+            last_id=self.last_classification_id,
+            scope="project",
+            project_id=self.project_id,
+            workflow_id=self.workflow_id
+        )
+        return [classification.raw for classification in classifications]
 
-        authenticate_with_zooniverse()
+    def _extract_preference_label(self, classification):
+        annotation = classification["annotations"][0]["value"]
+        label = self.annotation_to_preference_label[annotation]
+        return label
 
-        self._process_zoo_classifications()
-
-        # Find linked subject set
-        linked_subject_set = SubjectSet.find(self.subject_set_id)
-
-        # Get subject_id corresponding to query_id
-        subject_id = self.query_to_subject[query_id]
-
-        # Get reduced_label for subject_id aggregated from each annotation for that subject
-        reduced_label = self._reduce_annotations(self.subject_to_classifications[subject_id])
-
-        return reduced_label
+    def _assign_label_to_subject(self, subject_id, label):
+        try:
+            self.subject_to_preference_label[subject_id].append(label)
+        except KeyError:
+            subject = Subject.find(sid)
+            self.query_to_subject[subject.raw["metadata"]["query_id"]] = subject_id
+            self.subject_to_preference_label[subject_id] = [label]
 
     @staticmethod
     def _reduce_annotations(annotations):
-        # Aggregate Zooniverse classifications
+        np.random.shuffle(annotations)
         count = Counter(annotations)
         return count.most_common(1)[0][0]
 
